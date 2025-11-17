@@ -9,6 +9,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(tensorpipe LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
+add_compile_options("-Wno-error=maybe-uninitialized")
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
