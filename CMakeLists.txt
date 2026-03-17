@@ -23,6 +23,7 @@ include(Sanitize)
 include(MiscCheck)
 
 add_subdirectory(tensorpipe)
+add_subdirectory(apps)
 
 install(EXPORT TensorpipeTargets
         DESTINATION share/cmake/Tensorpipe
