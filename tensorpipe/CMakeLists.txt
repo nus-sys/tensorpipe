@@ -141,6 +141,20 @@ if(TP_ENABLE_SHM)
   set(TENSORPIPE_HAS_SHM_TRANSPORT 1)
 endif()
 
+### xrpc
+
+if(TP_ENABLE_SHM)
+  list(APPEND TP_SRCS
+    transport/xrpc/connection_impl.cc
+    transport/xrpc/context_impl.cc
+    transport/xrpc/factory.cc
+    transport/xrpc/listener_impl.cc
+    transport/xrpc/reactor.cc
+    transport/xrpc/sockaddr.cc)
+  list(APPEND TP_PUBLIC_HDRS
+    transport/xrpc/factory.h)
+endif()
+
 ### ibv
 
 tp_conditional_backend(
