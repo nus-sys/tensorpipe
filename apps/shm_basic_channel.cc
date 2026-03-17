@@ -1,6 +1,6 @@
-// Minimal example: SHM transport + basic channel
+// Minimal example: XRPC transport + basic channel
 //
-// The SHM transport carries control messages between two pipes on the same
+// The XRPC transport carries control messages between two pipes on the same
 // machine.  The basic channel uses that transport to move tensor payloads.
 // Both the listener ("server") and the connector ("client") run in the same
 // process so the example is self-contained.
@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <tensorpipe/tensorpipe.h>
+#include <tensorpipe/transport/xrpc/factory.h>
 
 int main()
 {
@@ -22,12 +23,12 @@ int main()
   // own Context with the same transport/channel registrations.
 
   tensorpipe::Context ctx;
-  // Priority 0: SHM transport (same machine, fast ring-buffer IPC)
-  ctx.registerTransport(0, "shm", tensorpipe::transport::shm::create());
+  // Priority 0: XRPC transport (same machine, shared-memory ring-buffer IPC)
+  ctx.registerTransport(0, "xrpc", tensorpipe::transport::xrpc::create());
   // Priority 0: basic channel (piggybacks on transport connections)
   ctx.registerChannel(0, "basic", tensorpipe::channel::basic::create());
 
-  const std::string addr = "shm://shm_basic_example";
+  const std::string addr = "xrpc://xrpc_basic_example";
 
   // ── Server side ──────────────────────────────────────────────────────────
   std::atomic<bool> done{false};
@@ -93,7 +94,7 @@ int main()
   auto pipe = ctx.connect(addr);
 
   // Payload: a plain byte string.
-  std::string text = "hello via SHM + basic channel";
+  std::string text = "hello via XRPC + basic channel";
 
   // Tensor: a small float array sent through the basic channel.
   std::vector<float> tensor = {1.0f, 2.0f, 3.0f, 4.0f};
