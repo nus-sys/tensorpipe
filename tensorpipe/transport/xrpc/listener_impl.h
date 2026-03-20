@@ -12,10 +12,11 @@
 #include <memory>
 #include <string>
 
-#include <tensorpipe/common/epoll_loop.h>
-#include <tensorpipe/common/socket.h>
 #include <tensorpipe/transport/listener_impl_boilerplate.h>
-#include <tensorpipe/transport/xrpc/sockaddr.h>
+
+#include <dax_connector.hpp>
+#include <diancie_shm/rpc_session.hpp>
+#include <rpc_mgr_msg.hpp>
 
 namespace tensorpipe {
 namespace transport {
@@ -25,18 +26,15 @@ class ConnectionImpl;
 class ContextImpl;
 
 class ListenerImpl final
-    : public ListenerImplBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl>,
-      public EpollLoop::EventHandler {
+    : public ListenerImplBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl> {
  public:
-  // Create a listener that listens on the specified address.
+  // Create a listener that registers the specified service name
+  // with the RPC Manager.
   ListenerImpl(
       ConstructorToken token,
       std::shared_ptr<ContextImpl> context,
       std::string id,
       std::string addr);
-
-  // Implementation of EventHandler.
-  void handleEventsFromLoop(int events) override;
 
  protected:
   // Implement the entry points called by ListenerImplBoilerplate.
@@ -46,9 +44,14 @@ class ListenerImpl final
   void handleErrorImpl() override;
 
  private:
-  Socket socket_;
-  Sockaddr sockaddr_;
+  std::string serviceName_;
   std::deque<accept_callback_fn> fns_;
+
+  // Owned RPCSession for the master side.
+  std::unique_ptr<diancie::RPCSession> session_;
+
+  // Poll the connector for incoming NOTIFY_CLIENT_REQ messages.
+  void pollForClients();
 };
 
 } // namespace xrpc

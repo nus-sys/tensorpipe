@@ -143,17 +143,22 @@ endif()
 
 ### xrpc
 
-if(TP_ENABLE_SHM)
-  list(APPEND TP_SRCS
-    transport/xrpc/connection_impl.cc
-    transport/xrpc/context_impl.cc
-    transport/xrpc/factory.cc
-    transport/xrpc/listener_impl.cc
-    transport/xrpc/reactor.cc
-    transport/xrpc/sockaddr.cc)
-  list(APPEND TP_PUBLIC_HDRS
-    transport/xrpc/factory.h)
-endif()
+list(APPEND TP_SRCS
+  transport/xrpc/connection_impl.cc
+  transport/xrpc/context_impl.cc
+  transport/xrpc/factory.cc
+  transport/xrpc/listener_impl.cc
+  transport/xrpc/poller.cc)
+list(APPEND TP_PUBLIC_HDRS
+  transport/xrpc/factory.h)
+# Diancie headers require C++20. Set property on xrpc source files.
+set(TP_XRPC_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/connection_impl.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/context_impl.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/factory.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/listener_impl.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/poller.cc)
+set_source_files_properties(${TP_XRPC_SRCS} PROPERTIES COMPILE_FLAGS "-std=gnu++20")
 
 ### ibv
 
@@ -214,6 +219,11 @@ endif()
 # Add all the link libraries and include directories to the tensorpipe target and keeping the link PUBLIC
 target_link_libraries(tensorpipe PRIVATE ${TP_LINK_LIBRARIES})
 target_include_directories(tensorpipe PUBLIC ${TP_INCLUDE_DIRS})
+
+# Link Diancie for xrpc transport.
+# Use LINK_ONLY to avoid propagating the target to the export set.
+target_link_libraries(tensorpipe PRIVATE $<LINK_ONLY:diancielib>)
+target_include_directories(tensorpipe PRIVATE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/diancie/include>)
 
 
 ## Install

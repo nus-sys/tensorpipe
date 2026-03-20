@@ -12,16 +12,14 @@
 #include <memory>
 #include <string>
 
-#include <tensorpipe/common/epoll_loop.h>
 #include <tensorpipe/common/nop.h>
 #include <tensorpipe/common/optional.h>
 #include <tensorpipe/common/ringbuffer.h>
 #include <tensorpipe/common/ringbuffer_read_write_ops.h>
-#include <tensorpipe/common/shm_segment.h>
-#include <tensorpipe/common/socket.h>
 #include <tensorpipe/transport/connection_impl_boilerplate.h>
-#include <tensorpipe/transport/xrpc/reactor.h>
-#include <tensorpipe/transport/xrpc/sockaddr.h>
+#include <tensorpipe/transport/xrpc/poller.h>
+
+#include <diancie_shm/rpc_session.hpp>
 
 namespace tensorpipe {
 namespace transport {
@@ -33,38 +31,35 @@ class ListenerImpl;
 class ConnectionImpl final : public ConnectionImplBoilerplate<
                                  ContextImpl,
                                  ListenerImpl,
-                                 ConnectionImpl>,
-                             public EpollLoop::EventHandler {
-  constexpr static size_t kBufferSize = 2 * 1024 * 1024;
+                                 ConnectionImpl> {
+  // Ring buffer data size: 512KB for inbox, 512KB for outbox.
+  static constexpr size_t kRingBufferSize = 512 * 1024;
 
-  constexpr static int kNumRingbufferRoles = 2;
+  static constexpr int kNumRingbufferRoles = 2;
   using Consumer = RingBufferRole<kNumRingbufferRoles, 0>;
   using Producer = RingBufferRole<kNumRingbufferRoles, 1>;
 
   enum State {
     INITIALIZING = 1,
-    SEND_FDS,
-    RECV_FDS,
     ESTABLISHED,
   };
 
  public:
-  // Create a connection that is already connected (e.g. from a listener).
+  // Create a connection from an accepted client (server side).
+  // channel_id is known from the NOTIFY_CLIENT_REQ.
   ConnectionImpl(
       ConstructorToken token,
       std::shared_ptr<ContextImpl> context,
       std::string id,
-      Socket socket);
+      diancie::channel_id_t channelId,
+      bool isServer);
 
-  // Create a connection that connects to the specified address.
+  // Create a connection that connects to the specified service (client side).
   ConnectionImpl(
       ConstructorToken token,
       std::shared_ptr<ContextImpl> context,
       std::string id,
       std::string addr);
-
-  // Implementation of EventHandler.
-  void handleEventsFromLoop(int events) override;
 
  protected:
   // Implement the entry points called by ConnectionImplBoilerplate.
@@ -80,68 +75,47 @@ class ConnectionImpl final : public ConnectionImplBoilerplate<
   void handleErrorImpl() override;
 
  private:
-  // Handle events of type EPOLLIN on the UNIX domain socket.
-  //
-  // The only data that is expected on that socket is the file descriptors for
-  // the other side's inbox (which is this side's outbox) and its reactor, plus
-  // the reactor tokens to trigger the other side to read or write.
-  void handleEventInFromLoop();
-
-  // Handle events of type EPOLLOUT on the UNIX domain socket.
-  //
-  // Once the socket is writable we send the file descriptors for this side's
-  // inbox (which the other side's outbox) and our reactor, plus the reactor
-  // tokens to trigger this connection to read or write.
-  void handleEventOutFromLoop();
-
   State state_{INITIALIZING};
-  Socket socket_;
-  optional<Sockaddr> sockaddr_;
 
-  // Inbox.
-  ShmSegment inboxHeaderSegment_;
-  ShmSegment inboxDataSegment_;
-  RingBuffer<kNumRingbufferRoles> inboxRb_;
-  optional<Reactor::TToken> inboxReactorToken_;
+  // Connection parameters.
+  diancie::channel_id_t channelId_{0};
+  bool isServer_{false};
+  optional<std::string> addr_;  // For client-side connections.
 
-  // Outbox.
-  ShmSegment outboxHeaderSegment_;
-  ShmSegment outboxDataSegment_;
-  RingBuffer<kNumRingbufferRoles> outboxRb_;
-  optional<Reactor::TToken> outboxReactorToken_;
+  // Diancie metadata for this channel.
+  std::unique_ptr<diancie::RPCConnectionMetaData> metadata_;
 
-  // Peer trigger/tokens.
-  optional<Reactor::Trigger> peerReactorTrigger_;
-  optional<Reactor::TToken> peerInboxReactorToken_;
-  optional<Reactor::TToken> peerOutboxReactorToken_;
+  // Ring buffers backed by Diancie shared memory.
+  // Memory layout within the channel's payload area:
+  //   [0 .. sizeof(RingBufferHeader<2>))                     -> inbox header
+  //   [sizeof(header) .. sizeof(header) + kRingBufferSize)   -> inbox data
+  //   [inbox_end .. inbox_end + sizeof(header))              -> outbox header
+  //   [inbox_end + sizeof(header) .. end)                    -> outbox data
+  optional<RingBuffer<kNumRingbufferRoles>> inboxRb_;
+  optional<RingBuffer<kNumRingbufferRoles>> outboxRb_;
 
-  // Pending read operations.
+  // Poller tokens for inbox/outbox notifications.
+  optional<Poller::TToken> inboxPollerToken_;
+  optional<Poller::TToken> outboxPollerToken_;
+
+  // Peer's queue entries for notification.
+  diancie::QueueEntry* peerInboxQe_{nullptr};
+  diancie::QueueEntry* peerOutboxQe_{nullptr};
+
+  // Pending read/write operations.
   std::deque<RingbufferReadOperation> readOperations_;
-
-  // Pending write operations.
   std::deque<RingbufferWriteOperation> writeOperations_;
 
-  // Process pending read operations if in an operational state.
-  //
-  // This may be triggered by the other side of the connection (by pushing this
-  // side's inbox token to the reactor) when it has written some new data to its
-  // outbox (which is this side's inbox). It is also called by this connection
-  // when it moves into an established state or when a new read operation is
-  // queued, in case data was already available before this connection was ready
-  // to consume it.
-  void processReadOperationsFromLoop();
+  void initServerSide();
+  void initClientSide();
+  void setupRingBuffers(bool swapInboxOutbox);
 
-  // Process pending write operations if in an operational state.
-  //
-  // This may be triggered by the other side of the connection (by pushing this
-  // side's outbox token to the reactor) when it has read some data from its
-  // inbox (which is this side's outbox). This is important when some of this
-  // side's writes couldn't complete because the outbox was full, and thus they
-  // needed to wait for some of its data to be read. This method is also called
-  // by this connection when it moves into an established state, in case some
-  // writes were queued before the connection was ready to process them, or when
-  // a new write operation is queued.
+  void processReadOperationsFromLoop();
   void processWriteOperationsFromLoop();
+
+  // Notify peer that data is available in their inbox / space freed in outbox.
+  void notifyPeerInbox();
+  void notifyPeerOutbox();
 };
 
 } // namespace xrpc

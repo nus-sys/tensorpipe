@@ -10,11 +10,13 @@
 
 #include <functional>
 #include <memory>
-#include <tuple>
+#include <string>
 
-#include <tensorpipe/common/epoll_loop.h>
 #include <tensorpipe/transport/context_impl_boilerplate.h>
-#include <tensorpipe/transport/xrpc/reactor.h>
+#include <tensorpipe/transport/xrpc/poller.h>
+
+#include <dax_connector.hpp>
+#include <diancie_shm/rpc_session.hpp>
 
 namespace tensorpipe {
 namespace transport {
@@ -26,29 +28,35 @@ class ListenerImpl;
 class ContextImpl final
     : public ContextImplBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl> {
  public:
-  static std::shared_ptr<ContextImpl> create();
+  static std::shared_ptr<ContextImpl> create(
+      const std::string& rpcMgrHost = "localhost",
+      int rpcMgrPort = 12345);
 
-  explicit ContextImpl(std::string domainDescriptor);
+  ContextImpl(
+      std::string domainDescriptor,
+      std::unique_ptr<diancie::DAXCXLConnector> connector);
 
   // Implement the DeferredExecutor interface.
   bool inLoop() const override;
   void deferToLoop(std::function<void()> fn) override;
 
-  void registerDescriptor(
-      int fd,
-      int events,
-      std::shared_ptr<EpollLoop::EventHandler> h);
+  // Expose Poller for ConnectionImpl/ListenerImpl.
+  Poller& getPoller();
 
-  void unregisterDescriptor(int fd);
+  // Expose DAXCXLConnector for ConnectionImpl/ListenerImpl.
+  diancie::DAXCXLConnector& getConnector();
 
-  using TToken = uint32_t;
-  using TFunction = std::function<void()>;
+  // DAX memory base and session, set by ListenerImpl (server side)
+  // or ConnectionImpl (client side) upon first mapping.
+  void setDaxBase(void* base, size_t size);
+  void* getDaxBase() const;
+  size_t getDaxSize() const;
 
-  TToken addReaction(TFunction fn);
+  void setSession(diancie::RPCSession* session);
+  diancie::RPCSession* getSession() const;
 
-  void removeReaction(TToken token);
-
-  std::tuple<int, int> reactorFds();
+  bool isMaster() const;
+  void setMaster(bool master);
 
  protected:
   // Implement the entry points called by ContextImplBoilerplate.
@@ -56,8 +64,13 @@ class ContextImpl final
   void joinImpl() override;
 
  private:
-  Reactor reactor_;
-  EpollLoop loop_{this->reactor_};
+  Poller poller_;
+  std::unique_ptr<diancie::DAXCXLConnector> connector_;
+
+  void* daxBase_ = nullptr;
+  size_t daxSize_ = 0;
+  diancie::RPCSession* session_ = nullptr;
+  bool isMaster_ = false;
 };
 
 } // namespace xrpc

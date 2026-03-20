@@ -9,6 +9,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include <tensorpipe/transport/context.h>
 
@@ -16,7 +17,9 @@ namespace tensorpipe {
 namespace transport {
 namespace xrpc {
 
-std::shared_ptr<Context> create();
+std::shared_ptr<Context> create(
+    const std::string& rpcMgrHost = "localhost",
+    int rpcMgrPort = 12345);
 
 } // namespace xrpc
 } // namespace transport

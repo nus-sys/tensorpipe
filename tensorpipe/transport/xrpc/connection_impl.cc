@@ -8,22 +8,20 @@
 
 #include <tensorpipe/transport/xrpc/connection_impl.h>
 
-#include <string.h>
-
+#include <cstring>
 #include <deque>
 #include <vector>
 
 #include <tensorpipe/common/callback.h>
 #include <tensorpipe/common/defs.h>
-#include <tensorpipe/common/epoll_loop.h>
 #include <tensorpipe/common/error_macros.h>
 #include <tensorpipe/common/ringbuffer_read_write_ops.h>
 #include <tensorpipe/common/ringbuffer_role.h>
-#include <tensorpipe/common/shm_ringbuffer.h>
 #include <tensorpipe/transport/error.h>
 #include <tensorpipe/transport/xrpc/context_impl.h>
-#include <tensorpipe/transport/xrpc/reactor.h>
-#include <tensorpipe/transport/xrpc/sockaddr.h>
+#include <tensorpipe/transport/xrpc/dax_util.h>
+
+#include <diancie_shm/rpc_malloc_internal.hpp>
 
 namespace tensorpipe {
 namespace transport {
@@ -33,12 +31,14 @@ ConnectionImpl::ConnectionImpl(
     ConstructorToken token,
     std::shared_ptr<ContextImpl> context,
     std::string id,
-    Socket socket)
+    diancie::channel_id_t channelId,
+    bool isServer)
     : ConnectionImplBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl>(
           token,
           std::move(context),
           std::move(id)),
-      socket_(std::move(socket)) {}
+      channelId_(channelId),
+      isServer_(isServer) {}
 
 ConnectionImpl::ConnectionImpl(
     ConstructorToken token,
@@ -49,64 +49,183 @@ ConnectionImpl::ConnectionImpl(
           token,
           std::move(context),
           std::move(id)),
-      sockaddr_(Sockaddr::createAbstractUnixAddr(addr)) {}
+      isServer_(false),
+      addr_(std::move(addr)) {}
 
 void ConnectionImpl::initImplFromLoop() {
   context_->enroll(*this);
 
-  Error error;
-  // The connection either got a socket or an address, but not both.
-  TP_DCHECK(socket_.hasValue() ^ sockaddr_.has_value());
-  if (!socket_.hasValue()) {
-    std::tie(error, socket_) = Socket::createForFamily(AF_UNIX);
-    if (error) {
-      setError(std::move(error));
-      return;
-    }
-    error = socket_.connect(sockaddr_.value());
-    if (error) {
-      setError(std::move(error));
-      return;
-    }
+  if (isServer_) {
+    initServerSide();
+  } else {
+    initClientSide();
   }
-  // Ensure underlying control socket is non-blocking such that it
-  // works well with event driven I/O.
-  error = socket_.block(false);
-  if (error) {
-    setError(std::move(error));
+}
+
+void ConnectionImpl::initClientSide() {
+  TP_DCHECK(addr_.has_value());
+  auto& connector = context_->getConnector();
+
+  // Request a channel from the RPC Manager.
+  diancie::rpc_mgr_request_channel_req_t req;
+  std::memset(&req, 0, sizeof(req));
+  req.type = diancie::rpc_mgr_msg_type_t::REQUEST_CHANNEL_REQ;
+  std::snprintf(
+      req.service_name, sizeof(req.service_name), "%s", addr_.value().c_str());
+  std::snprintf(
+      req.instance_id,
+      sizeof(req.instance_id),
+      "tp_client_%s",
+      id_.c_str());
+
+  if (!connector.send_command(&req, sizeof(req))) {
+    setError(TP_CREATE_ERROR(SystemError, "send REQUEST_CHANNEL_REQ", EIO));
     return;
   }
 
-  // Create ringbuffer for inbox.
-  std::tie(error, inboxHeaderSegment_, inboxDataSegment_, inboxRb_) =
-      createShmRingBuffer<kNumRingbufferRoles>(kBufferSize);
-  TP_THROW_ASSERT_IF(error)
-      << "Couldn't allocate ringbuffer for connection inbox: " << error.what();
+  diancie::rpc_mgr_request_channel_resp_t resp;
+  connector.recv_response(&resp, sizeof(resp));
+  if (resp.status != diancie::rpc_mgr_status_type_t::STATUS_OK) {
+    setError(TP_CREATE_ERROR(SystemError, "REQUEST_CHANNEL_RESP failed", EIO));
+    return;
+  }
 
-  // Register method to be called when our peer writes to our inbox.
-  inboxReactorToken_ = context_->addReaction([this]() {
+  channelId_ = resp.channel_id;
+
+  // Map DAX/SHM region if not already mapped by context.
+  if (context_->getDaxBase() == nullptr) {
+    auto mapping = DaxMapping::map(resp.device_path, resp.size, resp.offset);
+    if (mapping.base == nullptr) {
+      setError(TP_CREATE_ERROR(SystemError, "map DAX/SHM region", errno));
+      return;
+    }
+    context_->setDaxBase(mapping.base, mapping.size);
+  }
+
+  // Initialize client-side RPCSession thread.
+  void* base = context_->getDaxBase();
+  size_t size = context_->getDaxSize();
+
+  // Create a temporary session for thread_init.
+  diancie::RPCSession clientSession(base, size);
+  int threadId = channelId_ * 2 - 1;  // Client thread ID.
+  clientSession.thread_init(threadId);
+
+  // Set up ring buffers. Client swaps inbox/outbox relative to server.
+  setupRingBuffers(/*swapInboxOutbox=*/true);
+
+  state_ = ESTABLISHED;
+  processReadOperationsFromLoop();
+  processWriteOperationsFromLoop();
+}
+
+void ConnectionImpl::initServerSide() {
+  TP_DCHECK(channelId_ > 0);
+  // DAX base should already be set by the listener.
+  TP_DCHECK(context_->getDaxBase() != nullptr);
+
+  // Server-side thread_init was already done in ListenerImpl.
+  // Set up ring buffers. Server uses layout as-is.
+  setupRingBuffers(/*swapInboxOutbox=*/false);
+
+  state_ = ESTABLISHED;
+  processReadOperationsFromLoop();
+  processWriteOperationsFromLoop();
+}
+
+void ConnectionImpl::setupRingBuffers(bool swapInboxOutbox) {
+  void* base = context_->getDaxBase();
+  TP_DCHECK(base != nullptr);
+
+  // Create RPCConnectionMetaData for this channel.
+  metadata_ = std::make_unique<diancie::RPCConnectionMetaData>(
+      base, channelId_ - 1);
+
+  // Use the payload area for ring buffers.
+  // Layout within payload area:
+  //   [0] inbox header
+  //   [sizeof(header)] inbox data (kRingBufferSize)
+  //   [sizeof(header) + kRingBufferSize] outbox header
+  //   [2*sizeof(header) + kRingBufferSize] outbox data (kRingBufferSize)
+  using Header = RingBufferHeader<kNumRingbufferRoles>;
+  constexpr size_t headerSize = sizeof(Header);
+
+  uint8_t* payloadArea = static_cast<uint8_t*>(metadata_->get_payload_area());
+
+  uint8_t* firstHeaderPtr = payloadArea;
+  uint8_t* firstDataPtr = payloadArea + headerSize;
+  uint8_t* secondHeaderPtr = payloadArea + headerSize + kRingBufferSize;
+  uint8_t* secondDataPtr = payloadArea + 2 * headerSize + kRingBufferSize;
+
+  Header* inboxHeader;
+  uint8_t* inboxData;
+  Header* outboxHeader;
+  uint8_t* outboxData;
+
+  if (!swapInboxOutbox) {
+    // Server: first region is inbox, second is outbox.
+    inboxHeader = reinterpret_cast<Header*>(firstHeaderPtr);
+    inboxData = firstDataPtr;
+    outboxHeader = reinterpret_cast<Header*>(secondHeaderPtr);
+    outboxData = secondDataPtr;
+  } else {
+    // Client: first region is outbox, second is inbox (swap).
+    outboxHeader = reinterpret_cast<Header*>(firstHeaderPtr);
+    outboxData = firstDataPtr;
+    inboxHeader = reinterpret_cast<Header*>(secondHeaderPtr);
+    inboxData = secondDataPtr;
+  }
+
+  // Initialize headers using placement new (only one side should do this).
+  // The server side initializes both headers since it maps first.
+  if (!swapInboxOutbox) {
+    new (inboxHeader) Header(kRingBufferSize);
+    new (outboxHeader) Header(kRingBufferSize);
+  }
+
+  inboxRb_.emplace(inboxHeader, inboxData);
+  outboxRb_.emplace(outboxHeader, outboxData);
+
+  // Determine which QueueEntries to poll and which to toggle.
+  // Server reads from client_queue (inbox notification) and
+  // server_queue is used for outbox notification.
+  // Client reads from server_queue (inbox notification) and
+  // client_queue is used for outbox notification.
+  diancie::QueueEntry* myInboxQe;
+  diancie::QueueEntry* myOutboxQe;
+
+  if (!swapInboxOutbox) {
+    // Server: poll client_queue for inbox, server_queue for outbox.
+    myInboxQe = metadata_->get_client_queue();
+    myOutboxQe = metadata_->get_server_queue();
+    peerInboxQe_ = metadata_->get_server_queue();
+    peerOutboxQe_ = metadata_->get_client_queue();
+  } else {
+    // Client: poll server_queue for inbox, client_queue for outbox.
+    myInboxQe = metadata_->get_server_queue();
+    myOutboxQe = metadata_->get_client_queue();
+    peerInboxQe_ = metadata_->get_client_queue();
+    peerOutboxQe_ = metadata_->get_server_queue();
+  }
+
+  // Register with the poller.
+  auto& poller = context_->getPoller();
+
+  inboxPollerToken_ = poller.add(myInboxQe, [this]() {
     TP_VLOG(9) << "Connection " << id_
                << " is reacting to the peer writing to the inbox";
     processReadOperationsFromLoop();
   });
 
-  // Register method to be called when our peer reads from our outbox.
-  outboxReactorToken_ = context_->addReaction([this]() {
+  outboxPollerToken_ = poller.add(myOutboxQe, [this]() {
     TP_VLOG(9) << "Connection " << id_
                << " is reacting to the peer reading from the outbox";
     processWriteOperationsFromLoop();
   });
-
-  // We're sending file descriptors first, so wait for writability.
-  state_ = SEND_FDS;
-  context_->registerDescriptor(socket_.fd(), EPOLLOUT, shared_from_this());
 }
 
 void ConnectionImpl::readImplFromLoop(read_callback_fn fn) {
   readOperations_.emplace_back(std::move(fn));
-
-  // If the inbox already contains some data, we may be able to process this
-  // operation right away.
   processReadOperationsFromLoop();
 }
 
@@ -119,9 +238,6 @@ void ConnectionImpl::readImplFromLoop(
           const Error& error, const void* /* unused */, size_t /* unused */) {
         fn(error);
       });
-
-  // If the inbox already contains some data, we may be able to process this
-  // operation right away.
   processReadOperationsFromLoop();
 }
 
@@ -130,9 +246,6 @@ void ConnectionImpl::readImplFromLoop(
     size_t length,
     read_callback_fn fn) {
   readOperations_.emplace_back(ptr, length, std::move(fn));
-
-  // If the inbox already contains some data, we may be able to process this
-  // operation right away.
   processReadOperationsFromLoop();
 }
 
@@ -141,9 +254,6 @@ void ConnectionImpl::writeImplFromLoop(
     size_t length,
     write_callback_fn fn) {
   writeOperations_.emplace_back(ptr, length, std::move(fn));
-
-  // If the outbox has some free space, we may be able to process this operation
-  // right away.
   processWriteOperationsFromLoop();
 }
 
@@ -151,161 +261,21 @@ void ConnectionImpl::writeImplFromLoop(
     const AbstractNopHolder& object,
     write_callback_fn fn) {
   writeOperations_.emplace_back(&object, std::move(fn));
-
-  // If the outbox has some free space, we may be able to process this operation
-  // right away.
   processWriteOperationsFromLoop();
-}
-
-void ConnectionImpl::handleEventsFromLoop(int events) {
-  TP_DCHECK(context_->inLoop());
-  TP_VLOG(9) << "Connection " << id_ << " is handling an event on its socket ("
-             << EpollLoop::formatEpollEvents(events) << ")";
-
-  // Handle only one of the events in the mask. Events on the control
-  // file descriptor are rare enough for the cost of having epoll call
-  // into this function multiple times to not matter. The benefit is
-  // that every handler can close and unregister the control file
-  // descriptor from the event loop, without worrying about the next
-  // handler trying to do so as well.
-  // In some cases the socket could be in a state where it's both in an error
-  // state and readable/writable. If we checked for EPOLLIN or EPOLLOUT first
-  // and then returned after handling them, we would keep doing so forever and
-  // never reach the error handling. So we should keep the error check first.
-  if (events & EPOLLERR) {
-    int error;
-    socklen_t errorlen = sizeof(error);
-    int rv = getsockopt(
-        socket_.fd(),
-        SOL_SOCKET,
-        SO_ERROR,
-        reinterpret_cast<void*>(&error),
-        &errorlen);
-    if (rv == -1) {
-      setError(TP_CREATE_ERROR(SystemError, "getsockopt", rv));
-    } else {
-      setError(TP_CREATE_ERROR(SystemError, "async error on socket", error));
-    }
-    return;
-  }
-  if (events & EPOLLIN) {
-    handleEventInFromLoop();
-    return;
-  }
-  if (events & EPOLLOUT) {
-    handleEventOutFromLoop();
-    return;
-  }
-  // Check for hangup last, as there could be cases where we get EPOLLHUP but
-  // there's still data to be read from the socket, so we want to deal with that
-  // before dealing with the hangup.
-  if (events & EPOLLHUP) {
-    setError(TP_CREATE_ERROR(EOFError));
-    return;
-  }
-}
-
-void ConnectionImpl::handleEventInFromLoop() {
-  TP_DCHECK(context_->inLoop());
-  if (state_ == RECV_FDS) {
-    Fd reactorHeaderFd;
-    Fd reactorDataFd;
-    Fd outboxHeaderFd;
-    Fd outboxDataFd;
-    Reactor::TToken peerInboxReactorToken;
-    Reactor::TToken peerOutboxReactorToken;
-
-    // Receive the reactor token, reactor fds, and inbox fds.
-    auto err = socket_.recvPayloadAndFds(
-        peerInboxReactorToken,
-        peerOutboxReactorToken,
-        reactorHeaderFd,
-        reactorDataFd,
-        outboxHeaderFd,
-        outboxDataFd);
-    if (err) {
-      setError(std::move(err));
-      return;
-    }
-
-    // Load ringbuffer for outbox.
-    std::tie(err, outboxHeaderSegment_, outboxDataSegment_, outboxRb_) =
-        loadShmRingBuffer<kNumRingbufferRoles>(
-            std::move(outboxHeaderFd), std::move(outboxDataFd));
-    TP_THROW_ASSERT_IF(err)
-        << "Couldn't access ringbuffer of connection outbox: " << err.what();
-
-    // Initialize remote reactor trigger.
-    peerReactorTrigger_.emplace(
-        std::move(reactorHeaderFd), std::move(reactorDataFd));
-
-    peerInboxReactorToken_ = peerInboxReactorToken;
-    peerOutboxReactorToken_ = peerOutboxReactorToken;
-
-    // The connection is usable now.
-    state_ = ESTABLISHED;
-    processWriteOperationsFromLoop();
-    // Trigger read operations in case a pair of local read() and remote
-    // write() happened before connection is established. Otherwise read()
-    // callback would lose if it's the only read() request.
-    processReadOperationsFromLoop();
-    return;
-  }
-
-  if (state_ == ESTABLISHED) {
-    // We don't expect to read anything on this socket once the
-    // connection has been established. If we do, assume it's a
-    // zero-byte read indicating EOF.
-    setError(TP_CREATE_ERROR(EOFError));
-    return;
-  }
-
-  TP_THROW_ASSERT() << "EPOLLIN event not handled in state " << state_;
-}
-
-void ConnectionImpl::handleEventOutFromLoop() {
-  TP_DCHECK(context_->inLoop());
-  if (state_ == SEND_FDS) {
-    int reactorHeaderFd;
-    int reactorDataFd;
-    std::tie(reactorHeaderFd, reactorDataFd) = context_->reactorFds();
-
-    // Send our reactor token, reactor fds, and inbox fds.
-    auto err = socket_.sendPayloadAndFds(
-        inboxReactorToken_.value(),
-        outboxReactorToken_.value(),
-        reactorHeaderFd,
-        reactorDataFd,
-        inboxHeaderSegment_.getFd(),
-        inboxDataSegment_.getFd());
-    if (err) {
-      setError(std::move(err));
-      return;
-    }
-
-    // Sent our fds. Wait for fds from peer.
-    state_ = RECV_FDS;
-    context_->registerDescriptor(socket_.fd(), EPOLLIN, shared_from_this());
-    return;
-  }
-
-  TP_THROW_ASSERT() << "EPOLLOUT event not handled in state " << state_;
 }
 
 void ConnectionImpl::processReadOperationsFromLoop() {
   TP_DCHECK(context_->inLoop());
 
-  // Process all read read operations that we can immediately serve, only
-  // when connection is established.
   if (state_ != ESTABLISHED) {
     return;
   }
-  // Serve read operations
-  Consumer inboxConsumer(inboxRb_);
+
+  Consumer inboxConsumer(inboxRb_.value());
   while (!readOperations_.empty()) {
     RingbufferReadOperation& readOperation = readOperations_.front();
     if (readOperation.handleRead(inboxConsumer) > 0) {
-      peerReactorTrigger_->run(peerOutboxReactorToken_.value());
+      notifyPeerOutbox();
     }
     if (readOperation.completed()) {
       readOperations_.pop_front();
@@ -322,17 +292,35 @@ void ConnectionImpl::processWriteOperationsFromLoop() {
     return;
   }
 
-  Producer outboxProducer(outboxRb_);
+  Producer outboxProducer(outboxRb_.value());
   while (!writeOperations_.empty()) {
     RingbufferWriteOperation& writeOperation = writeOperations_.front();
     if (writeOperation.handleWrite(outboxProducer) > 0) {
-      peerReactorTrigger_->run(peerInboxReactorToken_.value());
+      notifyPeerInbox();
     }
     if (writeOperation.completed()) {
       writeOperations_.pop_front();
     } else {
       break;
     }
+  }
+}
+
+void ConnectionImpl::notifyPeerInbox() {
+  // Toggle the peer's inbox QueueEntry flag to signal data available.
+  if (peerInboxQe_) {
+    bool currentF = peerInboxQe_->get_flag_F();
+    bool currentf = peerInboxQe_->get_flag_f();
+    peerInboxQe_->set_entry(0, currentF, !currentf);
+  }
+}
+
+void ConnectionImpl::notifyPeerOutbox() {
+  // Toggle the peer's outbox QueueEntry flag to signal space freed.
+  if (peerOutboxQe_) {
+    bool currentF = peerOutboxQe_->get_flag_F();
+    bool currentf = peerOutboxQe_->get_flag_f();
+    peerOutboxQe_->set_entry(0, currentF, !currentf);
   }
 }
 
@@ -345,19 +333,15 @@ void ConnectionImpl::handleErrorImpl() {
     writeOperation.handleError(error_);
   }
   writeOperations_.clear();
-  if (inboxReactorToken_.has_value()) {
-    context_->removeReaction(inboxReactorToken_.value());
-    inboxReactorToken_.reset();
+
+  auto& poller = context_->getPoller();
+  if (inboxPollerToken_.has_value()) {
+    poller.remove(inboxPollerToken_.value());
+    inboxPollerToken_.reset();
   }
-  if (outboxReactorToken_.has_value()) {
-    context_->removeReaction(outboxReactorToken_.value());
-    outboxReactorToken_.reset();
-  }
-  if (socket_.hasValue()) {
-    if (state_ > INITIALIZING) {
-      context_->unregisterDescriptor(socket_.fd());
-    }
-    socket_.reset();
+  if (outboxPollerToken_.has_value()) {
+    poller.remove(outboxPollerToken_.value());
+    outboxPollerToken_.reset();
   }
 
   context_->unenroll(*this);

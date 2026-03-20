@@ -17,9 +17,12 @@ namespace tensorpipe {
 namespace transport {
 namespace xrpc {
 
-std::shared_ptr<Context> create() {
+std::shared_ptr<Context> create(
+    const std::string& rpcMgrHost,
+    int rpcMgrPort) {
   return std::make_shared<
-      ContextBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl>>();
+      ContextBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl>>(
+      rpcMgrHost, rpcMgrPort);
 }
 
 } // namespace xrpc

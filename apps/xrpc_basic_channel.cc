@@ -1,9 +1,14 @@
 // Minimal example: XRPC transport + basic channel
 //
 // The XRPC transport carries control messages between two pipes on the same
-// machine.  The basic channel uses that transport to move tensor payloads.
+// machine using Diancie's DAX-mapped shared memory via the RPC Manager.
 // Both the listener ("server") and the connector ("client") run in the same
 // process so the example is self-contained.
+//
+// Prerequisites:
+//   1. Build diancie: ninja diancielib rpc_mgr
+//   2. Start RPC Manager: ./diancie/rpc_mgr (in background)
+//   3. Run this example: ./apps/xrpc_basic_channel
 
 #include <atomic>
 #include <chrono>
@@ -23,8 +28,9 @@ int main()
   // own Context with the same transport/channel registrations.
 
   tensorpipe::Context ctx;
-  // Priority 0: XRPC transport (same machine, shared-memory ring-buffer IPC)
-  ctx.registerTransport(0, "xrpc", tensorpipe::transport::xrpc::create());
+  // Priority 0: XRPC transport (same machine, Diancie DAX-mapped shared memory)
+  ctx.registerTransport(
+      0, "xrpc", tensorpipe::transport::xrpc::create("localhost", 12345));
   // Priority 0: basic channel (piggybacks on transport connections)
   ctx.registerChannel(0, "basic", tensorpipe::channel::basic::create());
 

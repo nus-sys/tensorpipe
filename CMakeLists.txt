@@ -22,6 +22,7 @@ include(Sanitize)
 # Misc checks to cope with various compiler modes.
 include(MiscCheck)
 
+add_subdirectory(diancie)
 add_subdirectory(tensorpipe)
 add_subdirectory(apps)
 

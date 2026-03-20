@@ -8,11 +8,9 @@
 
 #include <tensorpipe/transport/xrpc/context_impl.h>
 
-#include <tensorpipe/common/epoll_loop.h>
 #include <tensorpipe/common/system.h>
 #include <tensorpipe/transport/xrpc/connection_impl.h>
 #include <tensorpipe/transport/xrpc/listener_impl.h>
-#include <tensorpipe/transport/xrpc/reactor.h>
 
 namespace tensorpipe {
 namespace transport {
@@ -20,97 +18,89 @@ namespace xrpc {
 
 namespace {
 
-// Prepend descriptor with transport name so it's easy to
-// disambiguate descriptors when debugging.
 const std::string kDomainDescriptorPrefix{"xrpc:"};
 
 } // namespace
 
-std::shared_ptr<ContextImpl> ContextImpl::create() {
+std::shared_ptr<ContextImpl> ContextImpl::create(
+    const std::string& rpcMgrHost,
+    int rpcMgrPort) {
   std::ostringstream oss;
   oss << kDomainDescriptorPrefix;
 
-  // This transport only works across processes on the same machine, and we
-  // detect that by computing the boot ID.
+  // This transport only works across processes on the same machine.
   auto bootID = getBootID();
   TP_THROW_ASSERT_IF(!bootID.has_value()) << "Unable to read boot_id";
   oss << bootID.value();
 
-  // This transport bootstraps a connection by opening a UNIX domain socket, for
-  // which it uses an "abstract" address (i.e., just an identifier, which is not
-  // materialized to a filesystem path). In order for the two endpoints to
-  // access each other's address they must be in the same Linux kernel network
-  // namespace (see network_namespaces(7)).
-  auto nsID = getLinuxNamespaceId(LinuxNamespace::kNet);
-  if (!nsID.has_value()) {
-    TP_VLOG(8) << "Unable to read net namespace ID";
-    return nullptr;
-  }
-  oss << '_' << nsID.value();
-
-  // Over that UNIX domain socket, the two endpoints exchange file descriptors
-  // to regions of shared memory. Some restrictions may be in place that prevent
-  // allocating such regions, hence let's allocate one here to see if it works.
-  Error error;
-  ShmSegment segment;
-  std::tie(error, segment) = ShmSegment::alloc(1024 * 1024);
-  if (error) {
-    TP_VLOG(8) << "Couldn't allocate shared memory segment: " << error.what();
-    return nullptr;
-  }
-
-  // A separate problem is that /dev/shm may be sized too small for all the
-  // memory we need to allocate. However, our memory usage is unbounded, as it
-  // grows as we open more connections, hence we cannot check it in advance.
-
   std::string domainDescriptor = oss.str();
   TP_VLOG(8) << "The domain descriptor for XRPC is " << domainDescriptor;
-  return std::make_shared<ContextImpl>(std::move(domainDescriptor));
+
+  auto connector = std::make_unique<diancie::DAXCXLConnector>(
+      rpcMgrHost, rpcMgrPort);
+
+  return std::make_shared<ContextImpl>(
+      std::move(domainDescriptor), std::move(connector));
 }
 
-ContextImpl::ContextImpl(std::string domainDescriptor)
+ContextImpl::ContextImpl(
+    std::string domainDescriptor,
+    std::unique_ptr<diancie::DAXCXLConnector> connector)
     : ContextImplBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl>(
-          std::move(domainDescriptor)) {}
+          std::move(domainDescriptor)),
+      connector_(std::move(connector)) {}
 
 void ContextImpl::handleErrorImpl() {
-  loop_.close();
-  reactor_.close();
+  poller_.close();
 }
 
 void ContextImpl::joinImpl() {
-  loop_.join();
-  reactor_.join();
+  poller_.join();
 }
 
 bool ContextImpl::inLoop() const {
-  return reactor_.inLoop();
-};
+  return poller_.inLoop();
+}
 
 void ContextImpl::deferToLoop(std::function<void()> fn) {
-  reactor_.deferToLoop(std::move(fn));
-};
-
-void ContextImpl::registerDescriptor(
-    int fd,
-    int events,
-    std::shared_ptr<EpollLoop::EventHandler> h) {
-  loop_.registerDescriptor(fd, events, std::move(h));
+  poller_.deferToLoop(std::move(fn));
 }
 
-void ContextImpl::unregisterDescriptor(int fd) {
-  loop_.unregisterDescriptor(fd);
+Poller& ContextImpl::getPoller() {
+  return poller_;
 }
 
-ContextImpl::TToken ContextImpl::addReaction(TFunction fn) {
-  return reactor_.add(std::move(fn));
+diancie::DAXCXLConnector& ContextImpl::getConnector() {
+  return *connector_;
 }
 
-void ContextImpl::removeReaction(TToken token) {
-  reactor_.remove(token);
+void ContextImpl::setDaxBase(void* base, size_t size) {
+  daxBase_ = base;
+  daxSize_ = size;
 }
 
-std::tuple<int, int> ContextImpl::reactorFds() {
-  return reactor_.fds();
+void* ContextImpl::getDaxBase() const {
+  return daxBase_;
+}
+
+size_t ContextImpl::getDaxSize() const {
+  return daxSize_;
+}
+
+void ContextImpl::setSession(diancie::RPCSession* session) {
+  session_ = session;
+}
+
+diancie::RPCSession* ContextImpl::getSession() const {
+  return session_;
+}
+
+bool ContextImpl::isMaster() const {
+  return isMaster_;
+}
+
+void ContextImpl::setMaster(bool master) {
+  isMaster_ = master;
 }
 
 } // namespace xrpc
