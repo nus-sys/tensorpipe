@@ -158,7 +158,7 @@ set(TP_XRPC_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/factory.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/listener_impl.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/transport/xrpc/poller.cc)
-set_source_files_properties(${TP_XRPC_SRCS} PROPERTIES COMPILE_FLAGS "-std=gnu++20")
+set_source_files_properties(${TP_XRPC_SRCS} PROPERTIES COMPILE_FLAGS "-std=gnu++20 -mclflushopt -mclwb")
 
 ### ibv
 
