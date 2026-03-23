@@ -70,8 +70,17 @@ Poller::~Poller() {
 bool Poller::pollOnce() {
   bool didWork = false;
 
-  // Take a snapshot under the lock to avoid holding it while calling callbacks.
-  std::vector<std::pair<TToken, TFunction>> toCall;
+  // Collect ALL active callbacks.  We always invoke every callback because
+  // inbox and outbox notifications share the same QueueEntry flag_f toggle.
+  // Two rapid toggles (one from notifyPeerInbox, one from notifyPeerOutbox)
+  // can cancel each other out before the poller observes a change, causing a
+  // missed notification.  Unconditionally calling the callbacks is safe —
+  // processRead/WriteOperationsFromLoop are cheap no-ops when the ring buffer
+  // is empty or there are no pending operations.
+  //
+  // We still track flag changes so that didWork reflects actual data movement,
+  // letting BusyPollingLoop yield when the system is truly idle.
+  std::vector<TFunction> toCall;
   {
     std::unique_lock<std::mutex> lock(mutex_);
     for (TToken i = 0; i < entries_.size(); i++) {
@@ -83,15 +92,15 @@ bool Poller::pollOnce() {
       bool currentFlag = entry.qe->get_flag_f();
       if (currentFlag != entry.lastFlag) {
         entry.lastFlag = currentFlag;
-        toCall.emplace_back(i, entry.fn);
+        didWork = true;
       }
+      toCall.push_back(entry.fn);
     }
   }
 
-  for (auto& [token, fn] : toCall) {
+  for (auto& fn : toCall) {
     if (fn) {
       fn();
-      didWork = true;
     }
   }
 
